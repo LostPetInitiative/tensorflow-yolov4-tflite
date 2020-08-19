@@ -1,0 +1,6 @@
+checkpoints
+data
+detection_preview
+mAP/ground-truth
+mAP/predicted
+**__pycache__**
