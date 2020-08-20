@@ -11,11 +11,14 @@ from PIL import Image
 import cv2
 import numpy as np
 import os
+import sys
 import multiprocessing
 from tensorflow.compat.v1 import ConfigProto
 from tensorflow.compat.v1 import InteractiveSession
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
+import pandas as pd
+from tqdm import tqdm
 
 
 flags.DEFINE_string('framework', 'tf', '(tf, tflite, trt')
@@ -30,6 +33,16 @@ flags.DEFINE_string('model', 'yolov4', 'yolov3 or yolov4')
 flags.DEFINE_float('score', 0.25, 'score threshold')
 
 cpuCount = multiprocessing.cpu_count()
+
+imageCatalogPath = sys.argv[1]
+pet911DbPath = sys.argv[2]
+extractedCatalogPath = sys.argv[3]
+extractedDbPath = sys.argv[4]
+annotatationPreviewDbPath = sys.argv[5]
+
+
+binCount = 100
+
 
 # cat class 15
 # dog class 16
@@ -47,8 +60,10 @@ def main(_argv):
         infer = saved_model_loaded.signatures['serving_default']
 
         threadPool = ThreadPoolExecutor(max_workers=cpuCount*2)    
+        #threadPool = ThreadPoolExecutor(max_workers=1)    
         gpuPool = ThreadPoolExecutor(max_workers=1)    
         loop = asyncio.get_running_loop()
+        imageProcessingSemaphore = asyncio.Semaphore(cpuCount-1)
         
         def loadImage(imagePath):
             original_image = cv2.imread(imagePath)
@@ -60,9 +75,41 @@ def main(_argv):
             # image_data = image_data[np.newaxis, ...].astype(np.float32)
             return original_image, image_data
 
-        def rotateImage(image_data, rotation):
+        def rotateImage(image_data, augNum):
+            rot = augNum & 1
+            horFlip = augNum & 2
+            vertFlip = augNum & 4
+
+            rotated = image_data
+            # if augNum  > 0:
+            #     #rotated = np.rot90(rotated, k=2)
+            #     rotated = np.fliplr(np.flipud(rotated))
+
+            if augNum % 4 > 0:
+                rotated2 = np.copy(np.rot90(rotated, k= augNum % 4))
+            else:
+                rotated2 = rotated
+            if augNum > 3:
+                rotated3 = np.copy(np.flipud(rotated2))
+            else:
+                rotated3 = rotated2
+            # if horFlip == 1:
+            #     rotated = np.fliplr(rotated)
+            # if vertFlip == 1:
+            #     rotated = np.flupud(rotated)
+            # if rot == 1:
+            #     rotated = np.rot90(rotated, k=1)
+            # if horFlip == 1:
+            #     rotated = np.rot90(rotated, k=1)
+            # if vertFlip == 1:
+            #     rotated = np.flupud(rotated)
+            # if rot == 1:
+            #     rotated = np.rot90(rotated, k=1)
+            return rotated3
+
+        def rotateImageExt(image_data, rotation):
             images_data = []
-            images_data.append(np.rot90(image_data, k=rotation))
+            images_data.append(rotateImage(image_data, rotation))
             images_data = np.asarray(images_data).astype(np.float32)
             return images_data, rotation
         
@@ -128,56 +175,136 @@ def main(_argv):
         async def FindBestRotation(imagePath, targetClass):
             """Returns (annotatedImage,extractedPetImage, bestScore, bestRotation) or quadro-tuple on Nones if the pet is not detected"""
             original_image, image_data = await loop.run_in_executor(threadPool, loadImage, imagePath)
-            loadImageJobs = [loop.run_in_executor(threadPool,rotateImage, image_data, k) for k in range(4)]
+            loadImageJobs = [loop.run_in_executor(threadPool,rotateImageExt, image_data, k) for k in range(8)]
             bestScore = 0.0
             bestScoreBboxes = None
+            noRotationValid = False
+            spoiled = False
             bestRotation = 0
             for coro in asyncio.as_completed(loadImageJobs):
                 images_data, rotation = await coro
                 bboxes = await loop.run_in_executor(gpuPool,getBboxes, images_data, targetClass)
+                if noRotationValid or spoiled:
+                    continue
                 score = bboxes[1]
                 scoreShape = score.shape
                 detectedCount = scoreShape[1]
+                if (rotation == 0) and (detectedCount>1):
+                    # detected multiple pets on the original image. discarding all series
+                    spoiled = True
+                    bestScoreBboxes = None
                 if detectedCount != 1:
                     continue # we are interested in the case when only single pet detected
+                if rotation == 0:
+                    noRotationValid = True
                 scoreVal = score[0,0]
-                if scoreVal > bestScore: # selecting the rotation which gives the highest score
+                if (scoreVal > bestScore) or noRotationValid:
+                    # selecting the rotation which gives the highest score
+                    # absence of rotation has still higher priority
                     bestScore = scoreVal
                     bestScoreBboxes = bboxes
                     bestRotation = rotation
-            if bestScoreBboxes != None:
-                # did not find any rotation with single pet present
+            if not(bestScoreBboxes is None):
+                # found a rotation when a single pet of proper type is detected
                 if bestRotation != 0:
-                    rotatedImage = np.rot90(original_image,k=bestRotation)
+                    rotatedImage = rotateImage(original_image,bestRotation)
                 else:
                     rotatedImage = original_image
 
+                rotatedImage = cv2.cvtColor(rotatedImage, cv2.COLOR_BGR2RGB)
                 annotatedImage = np.copy(rotatedImage)
                 annotatedImage = utils.draw_bbox(annotatedImage, bestScoreBboxes)
-                annotatedImage = Image.fromarray(annotatedImage.astype(np.uint8))
-                annotatedImage = cv2.cvtColor(np.array(annotatedImage), cv2.COLOR_BGR2RGB)
+                
 
 
                 #image_h, image_w, _ = rotatedImage.shape
                 coor = bestScoreBboxes[0][0,0,:].astype(np.int32) # y1,x1,y2,x2
-                print("bbox {0}".format(coor))
+                #print("bbox {0}".format(coor))
                 # coor[0] = int(coor[0] * image_h)
                 # coor[2] = int(coor[2] * image_h)
                 # coor[1] = int(coor[1] * image_w)
                 # coor[3] = int(coor[3] * image_w)
 
-                print("rotated shape {0}".format(rotatedImage.shape))
+                #print("rotated shape {0}".format(rotatedImage.shape))
                 extracted = rotatedImage[coor[0]:coor[2], coor[1]:coor[3], :]
-                extracted = cv2.cvtColor(extracted, cv2.COLOR_BGR2RGB)
-                return annotatedImage, extracted, bestScore, bestRotation
+                return (annotatedImage, extracted, bestScore, bestRotation)
             else:
-                return None, None, None, None
+                return (None, None, None, None)
         
-        annotatedImage,extractedImage, bestScore,rotation = await FindBestRotation("/mnt/ML/LostPetInitiative/pet911ru/rf240266/424288.jpg", 16)
+        catalogDf = pd.read_csv(imageCatalogPath)
 
-        cv2.imwrite(os.path.join("/mnt/ssd/PetSimilarity-ML/test","annotated.jpg"), annotatedImage)
-        cv2.imwrite(os.path.join("/mnt/ssd/PetSimilarity-ML/test","extracted.jpg"), extractedImage)
-        print("best score {0} at rotation {1}".format(bestScore, rotation))
+        #catalogDf = catalogDf.iloc[0:1000,]
+
+        rowsCount = len(catalogDf)
+        print("{0} images to process".format(rowsCount))
+        tasks = list()
+        for row in tqdm(catalogDf.itertuples(), desc="images queued", ascii=True, total=rowsCount):
+            if row.dublicate or row.currupted:
+                continue
+            if row.type == "lost":
+                prefix = "rl"
+            else:
+                prefix = "rf"
+            imagePath = os.path.join(pet911DbPath, "{0}{1}".format(prefix,row.petId), row.imageFile)
+            if row.pet == "cat":
+                targetClass = 15
+            else:
+                targetClass = 16
+            async def task(imagePath, targetClass, row):
+                await imageProcessingSemaphore.acquire()
+                try:
+                    result = await FindBestRotation(imagePath, targetClass)
+                finally:
+                    imageProcessingSemaphore.release()
+                return (result,row)
+            tasks.append(asyncio.create_task(task(imagePath, targetClass, row)))
+
+        tasksCount = len(tasks)
+
+        def DumpTaskResult(detectedBbox, row):
+            (annotatedImage,extractedImage, bestScore,rotation) = detectedBbox
+            petId = int(row.petId)
+            imageFile = row.imageFile
+            imageId = int(imageFile[:-4]) 
+            annoBinNun = petId % binCount
+            extrBinNum = imageId % binCount
+            annotationPreviewPath = os.path.join(annotatationPreviewDbPath,str(annoBinNun), "{0}_{1}_{2}_{3:.2f}.jpg".format(row.petId,imageId,rotation,bestScore))
+            extractionPath = os.path.join(extractedDbPath,str(extrBinNum), imageFile)
+            cv2.imwrite(annotationPreviewPath, annotatedImage)
+            cv2.imwrite(extractionPath, extractedImage)
+
+        # precreating dirs
+        for binNum in range(binCount):
+            annotationBinPath = os.path.join(annotatationPreviewDbPath,str(binNum))
+            extractionBinPath = os.path.join(extractedDbPath,str(binNum))
+            if not os.path.exists(annotationBinPath):
+                os.mkdir(annotationBinPath)
+            if not os.path.exists(extractionBinPath):
+                os.mkdir(extractionBinPath)
+
+        resultDumpTasks = list()
+        retainedIndex = list()
+        for coro in tqdm(asyncio.as_completed(tasks), desc = "Image processed", total=tasksCount,ascii=True):
+            detectedBbox,row = await coro
+            #print("detectedBbox {0}".format(detectedBbox))
+            if not(detectedBbox[0] is None):
+                # pet detected
+                resultDumpTasks.append(loop.run_in_executor(threadPool,DumpTaskResult,detectedBbox,row))
+                retainedIndex.append(row.Index)
+                #print("valid index {0}; image {1}".format(row.Index,row.imageFile))
+        print("Waiting for the image to disk dump tasks")
+        for coro in tqdm(asyncio.as_completed(resultDumpTasks), desc="Image disk dumps", total=len(resultDumpTasks),ascii=True):
+            await coro
+        
+        print("dumping catalog (retained {0} images)".format(len(retainedIndex)))
+        retainedDf = catalogDf[catalogDf.index.isin(retainedIndex)]
+        retainedDf.to_csv(extractedCatalogPath,index=False)
+
+
+        #annotatedImage,extractedImage, bestScore,rotation = await FindBestRotation("/mnt/ML/LostPetInitiative/pet911ru/rl142593/239343.jpg", 15)
+        #cv2.imwrite(os.path.join("/mnt/ssd/PetSimilarity-ML/test","annotated.jpg"), annotatedImage)
+        #cv2.imwrite(os.path.join("/mnt/ssd/PetSimilarity-ML/test","extracted.jpg"), extractedImage)
+        #print("best score {0} at rotation {1}".format(bestScore, rotation))
     asyncio.run(work())
 
 if __name__ == '__main__':
