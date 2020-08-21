@@ -9,12 +9,13 @@ from core.yolov4 import filter_boxes
 from tensorflow.python.saved_model import tag_constants
 from PIL import Image
 import cv2
+from skimage import io
 import numpy as np
 import os
 import sys
 import multiprocessing
-from tensorflow.compat.v1 import ConfigProto
-from tensorflow.compat.v1 import InteractiveSession
+# from tensorflow.compat.v1 import ConfigProto
+# from tensorflow.compat.v1 import InteractiveSession
 from concurrent.futures import ThreadPoolExecutor
 import asyncio
 import pandas as pd
@@ -49,14 +50,25 @@ binCount = 100
 
 def main(_argv):
     async def work():
-        config = ConfigProto()
-        config.gpu_options.allow_growth = True
-        session = InteractiveSession(config=config)
         STRIDES, ANCHORS, NUM_CLASS, XYSCALE = utils.load_config(FLAGS)
         input_size = FLAGS.size
 
+        # def InitModel(currentSession = None):
+        #     if not(currentSession is None):
+        #         currentSession.close()
+        #     config = ConfigProto()
+        #     config.gpu_options.allow_growth = True
+        #     session = InteractiveSession(config=config)
+
+            
+
+        #     return session
+
+        #tf.compat.v1.disable_eager_execution()
+        print("Executing eagerly: {0}".format(tf.executing_eagerly()))
+        
         saved_model_loaded = tf.saved_model.load(FLAGS.weights, tags=[tag_constants.SERVING])
-        print("Loaded model {0}".format(FLAGS.weights))
+        print("(Re)Loaded model {0}".format(FLAGS.weights))
         infer = saved_model_loaded.signatures['serving_default']
 
         threadPool = ThreadPoolExecutor(max_workers=cpuCount*2)    
@@ -66,9 +78,20 @@ def main(_argv):
         imageProcessingSemaphore = asyncio.Semaphore(cpuCount-1)
         
         def loadImage(imagePath):
-            original_image = cv2.imread(imagePath)
-            original_image = cv2.cvtColor(original_image, cv2.COLOR_BGR2RGB)
+            if imagePath.endswith(".png"):
+                original_image = io.imread(imagePath,plugin='imread')
+            else:
+                original_image = io.imread(imagePath)
 
+            imShape = original_image.shape
+            #print("imhsape is {0}".format(imShape))
+            if len(imShape) == 2: # greyscale
+                original_image = np.copy(np.tile(np.expand_dims(original_image, axis=2),(1,1,3)))
+            else:    
+                if imShape[2] == 4: #RGBA
+                    original_image = np.copy(original_image[:,:,0:3])
+            #print("fixed hsape is {0}".format(original_image.shape))
+            
             # image_data = utils.image_preprocess(np.copy(original_image), [input_size, input_size])
             image_data = cv2.resize(original_image, (input_size, input_size))
             image_data = image_data / 255.
@@ -113,10 +136,15 @@ def main(_argv):
             images_data = np.asarray(images_data).astype(np.float32)
             return images_data, rotation
         
+        # def getBboxesStub(images_data, targetClass:int):
+        #     return [np.zero, npScores, npClasses, npValidDetections]
+
         def getBboxes(images_data, targetClass:int):
             #print("images_data shape {0}".format(images_data.shape))
         
             batch_data = tf.constant(images_data)
+            #print("batch data {0}".format(type(batch_data)))
+            #exit(1)
             pred_bbox = infer(batch_data) # works only for batch size 1 and 2 for some reason
             for key, value in pred_bbox.items():
                 boxes = value[:, :, 0:4]
@@ -211,12 +239,10 @@ def main(_argv):
                 else:
                     rotatedImage = original_image
 
-                rotatedImage = cv2.cvtColor(rotatedImage, cv2.COLOR_BGR2RGB)
+                #rotatedImage = cv2.cvtColor(rotatedImage, cv2.COLOR_BGR2RGB)
                 annotatedImage = np.copy(rotatedImage)
                 annotatedImage = utils.draw_bbox(annotatedImage, bestScoreBboxes)
                 
-
-
                 #image_h, image_w, _ = rotatedImage.shape
                 coor = bestScoreBboxes[0][0,0,:].astype(np.int32) # y1,x1,y2,x2
                 #print("bbox {0}".format(coor))
@@ -228,9 +254,26 @@ def main(_argv):
                 #print("rotated shape {0}".format(rotatedImage.shape))
                 extracted = rotatedImage[coor[0]:coor[2], coor[1]:coor[3], :]
                 return (annotatedImage, extracted, bestScore, bestRotation)
+                #return (None, None, None, None)
             else:
                 return (None, None, None, None)
         
+        def DumpTaskResult(detectedBbox, row):
+            (annotatedImage,extractedImage, bestScore,rotation) = detectedBbox
+            petId = int(row.petId)
+            imageFile = row.imageFile
+            imageId = int(imageFile[:-4]) 
+            annoBinNun = petId % binCount
+            extrBinNum = imageId % binCount
+            annotationPreviewPath = os.path.join(annotatationPreviewDbPath,str(annoBinNun), "{0}_{1}_{2}_{3:.2f}.jpg".format(row.petId,imageId,rotation,bestScore))
+            extractionPath = os.path.join(extractedDbPath,str(extrBinNum), imageFile)
+            io.imsave(annotationPreviewPath, annotatedImage)
+            io.imsave(extractionPath, extractedImage)
+
+        async def DumpTaskResultAsync(detectedBbox, row):
+            await loop.run_in_executor(threadPool,DumpTaskResult,detectedBbox,row)
+        
+
         catalogDf = pd.read_csv(imageCatalogPath)
 
         #catalogDf = catalogDf.iloc[0:1000,]
@@ -254,25 +297,18 @@ def main(_argv):
                 await imageProcessingSemaphore.acquire()
                 try:
                     result = await FindBestRotation(imagePath, targetClass)
+                    if not(result[0] is None):
+                        await DumpTaskResultAsync(result, row)
+                        return row.Index
+                    else:
+                        return None
                 finally:
                     imageProcessingSemaphore.release()
-                return (result,row)
             tasks.append(asyncio.create_task(task(imagePath, targetClass, row)))
 
         tasksCount = len(tasks)
 
-        def DumpTaskResult(detectedBbox, row):
-            (annotatedImage,extractedImage, bestScore,rotation) = detectedBbox
-            petId = int(row.petId)
-            imageFile = row.imageFile
-            imageId = int(imageFile[:-4]) 
-            annoBinNun = petId % binCount
-            extrBinNum = imageId % binCount
-            annotationPreviewPath = os.path.join(annotatationPreviewDbPath,str(annoBinNun), "{0}_{1}_{2}_{3:.2f}.jpg".format(row.petId,imageId,rotation,bestScore))
-            extractionPath = os.path.join(extractedDbPath,str(extrBinNum), imageFile)
-            cv2.imwrite(annotationPreviewPath, annotatedImage)
-            cv2.imwrite(extractionPath, extractedImage)
-
+          
         # precreating dirs
         for binNum in range(binCount):
             annotationBinPath = os.path.join(annotatationPreviewDbPath,str(binNum))
@@ -282,25 +318,18 @@ def main(_argv):
             if not os.path.exists(extractionBinPath):
                 os.mkdir(extractionBinPath)
 
-        resultDumpTasks = list()
         retainedIndex = list()
         for coro in tqdm(asyncio.as_completed(tasks), desc = "Image processed", total=tasksCount,ascii=True):
-            detectedBbox,row = await coro
-            #print("detectedBbox {0}".format(detectedBbox))
-            if not(detectedBbox[0] is None):
-                # pet detected
-                resultDumpTasks.append(loop.run_in_executor(threadPool,DumpTaskResult,detectedBbox,row))
-                retainedIndex.append(row.Index)
-                #print("valid index {0}; image {1}".format(row.Index,row.imageFile))
-        print("Waiting for the image to disk dump tasks")
-        for coro in tqdm(asyncio.as_completed(resultDumpTasks), desc="Image disk dumps", total=len(resultDumpTasks),ascii=True):
-            await coro
-        
+            retainedIdx = await coro
+            if not(retainedIdx is None):
+                retainedIndex.append(retainedIdx)
         print("dumping catalog (retained {0} images)".format(len(retainedIndex)))
         retainedDf = catalogDf[catalogDf.index.isin(retainedIndex)]
         retainedDf.to_csv(extractedCatalogPath,index=False)
 
-
+        print("Waiting for the image to disk dump tasks")
+        threadPool.shutdown(wait=True)
+        
         #annotatedImage,extractedImage, bestScore,rotation = await FindBestRotation("/mnt/ML/LostPetInitiative/pet911ru/rl142593/239343.jpg", 15)
         #cv2.imwrite(os.path.join("/mnt/ssd/PetSimilarity-ML/test","annotated.jpg"), annotatedImage)
         #cv2.imwrite(os.path.join("/mnt/ssd/PetSimilarity-ML/test","extracted.jpg"), extractedImage)
